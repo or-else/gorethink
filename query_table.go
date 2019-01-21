@@ -1,20 +1,33 @@
-package gorethink
+package rethinkdb
 
 import (
-	p "github.com/dancannon/gorethink/ql2"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // TableCreateOpts contains the optional arguments for the TableCreate term
 type TableCreateOpts struct {
-	PrimaryKey        interface{} `gorethink:"primary_key,omitempty"`
-	Durability        interface{} `gorethink:"durability,omitempty"`
-	Shards            interface{} `gorethink:"shards,omitempty"`
-	DataCenter        interface{} `gorethink:"replicas,omitempty"`
-	PrimaryReplicaTag interface{} `gorethink:"primary_replica_tag,omitempty"`
+	PrimaryKey           interface{} `rethinkdb:"primary_key,omitempty"`
+	Durability           interface{} `rethinkdb:"durability,omitempty"`
+	Shards               interface{} `rethinkdb:"shards,omitempty"`
+	Replicas             interface{} `rethinkdb:"replicas,omitempty"`
+	PrimaryReplicaTag    interface{} `rethinkdb:"primary_replica_tag,omitempty"`
+	NonVotingReplicaTags interface{} `rethinkdb:"nonvoting_replica_tags,omitempty"`
 }
 
-func (o *TableCreateOpts) toMap() map[string]interface{} {
+func (o TableCreateOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
+}
+
+// TableCreate creates a table. A RethinkDB table is a collection of JSON
+// documents.
+//
+// Note: Only alphanumeric characters and underscores are valid for the table name.
+func TableCreate(name interface{}, optArgs ...TableCreateOpts) Term {
+	opts := map[string]interface{}{}
+	if len(optArgs) >= 1 {
+		opts = optArgs[0].toMap()
+	}
+	return constructRootTerm("TableCreate", p.Term_TABLE_CREATE, []interface{}{name}, opts)
 }
 
 // TableCreate creates a table. A RethinkDB table is a collection of JSON
@@ -30,8 +43,18 @@ func (t Term) TableCreate(name interface{}, optArgs ...TableCreateOpts) Term {
 }
 
 // TableDrop deletes a table. The table and all its data will be deleted.
+func TableDrop(args ...interface{}) Term {
+	return constructRootTerm("TableDrop", p.Term_TABLE_DROP, args, map[string]interface{}{})
+}
+
+// TableDrop deletes a table. The table and all its data will be deleted.
 func (t Term) TableDrop(args ...interface{}) Term {
 	return constructMethodTerm(t, "TableDrop", p.Term_TABLE_DROP, args, map[string]interface{}{})
+}
+
+// TableList lists all table names in a database.
+func TableList(args ...interface{}) Term {
+	return constructRootTerm("TableList", p.Term_TABLE_LIST, args, map[string]interface{}{})
 }
 
 // TableList lists all table names in a database.
@@ -41,11 +64,11 @@ func (t Term) TableList(args ...interface{}) Term {
 
 // IndexCreateOpts contains the optional arguments for the IndexCreate term
 type IndexCreateOpts struct {
-	Multi interface{} `gorethink:"multi,omitempty"`
-	Geo   interface{} `gorethink:"geo,omitempty"`
+	Multi interface{} `rethinkdb:"multi,omitempty"`
+	Geo   interface{} `rethinkdb:"geo,omitempty"`
 }
 
-func (o *IndexCreateOpts) toMap() map[string]interface{} {
+func (o IndexCreateOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -56,9 +79,8 @@ func (o *IndexCreateOpts) toMap() map[string]interface{} {
 // IndexCreate supports the creation of the following types of indexes, to create
 // indexes using arbitrary expressions use IndexCreateFunc.
 //   - Simple indexes based on the value of a single field.
-//   - Compound indexes based on multiple fields.
-//   - Multi indexes based on arrays of values, created when the multi optional argument is true.
-//   - Geospatial indexes based on indexes of geometry objects, created when the geo optional argument is true.
+//   - Geospatial indexes based on indexes of geometry objects, created when the
+//     geo optional argument is true.
 func (t Term) IndexCreate(name interface{}, optArgs ...IndexCreateOpts) Term {
 	opts := map[string]interface{}{}
 	if len(optArgs) >= 1 {
@@ -69,10 +91,15 @@ func (t Term) IndexCreate(name interface{}, optArgs ...IndexCreateOpts) Term {
 
 // IndexCreateFunc creates a new secondary index on a table. Secondary indexes
 // improve the speed of many read queries at the slight cost of increased
-// storage space and decreased write performance.
+// storage space and decreased write performance. The function takes a index
+// name and RQL term as the index value , the term can be an anonymous function
+// or a binary representation obtained from the function field of indexStatus.
 //
-// The indexFunction can be an anonymous function or a binary representation
-// obtained from the function field of indexStatus.
+// It supports the creation of the following types of indexes.
+//   - Simple indexes based on the value of a single field where the index has a
+//     different name to the field.
+//   - Compound indexes based on multiple fields.
+//   - Multi indexes based on arrays of values, created when the multi optional argument is true.
 func (t Term) IndexCreateFunc(name, indexFunction interface{}, optArgs ...IndexCreateOpts) Term {
 	opts := map[string]interface{}{}
 	if len(optArgs) >= 1 {
@@ -93,10 +120,10 @@ func (t Term) IndexList(args ...interface{}) Term {
 
 // IndexRenameOpts contains the optional arguments for the IndexRename term
 type IndexRenameOpts struct {
-	Overwrite interface{} `gorethink:"overwrite,omitempty"`
+	Overwrite interface{} `rethinkdb:"overwrite,omitempty"`
 }
 
-func (o *IndexRenameOpts) toMap() map[string]interface{} {
+func (o IndexRenameOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -123,12 +150,16 @@ func (t Term) IndexWait(args ...interface{}) Term {
 
 // ChangesOpts contains the optional arguments for the Changes term
 type ChangesOpts struct {
-	Squash        interface{} `gorethink:"squash,omitempty"`
-	IncludeStates interface{} `gorethink:"include_states,omitempty"`
+	Squash              interface{} `rethinkdb:"squash,omitempty"`
+	IncludeInitial      interface{} `rethinkdb:"include_initial,omitempty"`
+	IncludeStates       interface{} `rethinkdb:"include_states,omitempty"`
+	IncludeOffsets      interface{} `rethinkdb:"include_offsets,omitempty"`
+	IncludeTypes        interface{} `rethinkdb:"include_types,omitempty"`
+	ChangefeedQueueSize interface{} `rethinkdb:"changefeed_queue_size,omitempty"`
 }
 
 // ChangesOpts contains the optional arguments for the Changes term
-func (o *ChangesOpts) toMap() map[string]interface{} {
+func (o ChangesOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 

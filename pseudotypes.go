@@ -1,4 +1,4 @@
-package gorethink
+package rethinkdb
 
 import (
 	"encoding/base64"
@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/dancannon/gorethink/types"
+	"gopkg.in/rethinkdb/rethinkdb-go.v5/types"
 
 	"fmt"
 )
@@ -42,8 +42,10 @@ func convertPseudotype(obj map[string]interface{}, opts map[string]interface{}) 
 				}
 			}
 
-			if groupFormat == "native" {
-				return reqlGroupedDataToObj(obj)
+			if groupFormat == "native" || groupFormat == "slice" {
+				return reqlGroupedDataToSlice(obj)
+			} else if groupFormat == "map" {
+				return reqlGroupedDataToMap(obj)
 			} else if groupFormat == "raw" {
 				return obj, nil
 			} else {
@@ -126,7 +128,8 @@ func recursivelyConvertPseudotype(obj interface{}, opts map[string]interface{}) 
 func reqlTimeToNativeTime(timestamp float64, timezone string) (time.Time, error) {
 	sec, ms := math.Modf(timestamp)
 
-	t := time.Unix(int64(sec), int64(ms*1000*1000*1000))
+	// Convert to native time rounding to milliseconds
+	t := time.Unix(int64(sec), int64(math.Floor(ms*1000+0.5))*1000*1000)
 
 	// Caclulate the timezone
 	if timezone != "" {
@@ -149,7 +152,7 @@ func reqlTimeToNativeTime(timestamp float64, timezone string) (time.Time, error)
 	return t, nil
 }
 
-func reqlGroupedDataToObj(obj map[string]interface{}) (interface{}, error) {
+func reqlGroupedDataToSlice(obj map[string]interface{}) (interface{}, error) {
 	if data, ok := obj["data"]; ok {
 		ret := []interface{}{}
 		for _, v := range data.([]interface{}) {
@@ -158,6 +161,18 @@ func reqlGroupedDataToObj(obj map[string]interface{}) (interface{}, error) {
 				"group":     v[0],
 				"reduction": v[1],
 			})
+		}
+		return ret, nil
+	}
+	return nil, fmt.Errorf("pseudo-type GROUPED_DATA object %v does not have the expected field \"data\"", obj)
+}
+
+func reqlGroupedDataToMap(obj map[string]interface{}) (interface{}, error) {
+	if data, ok := obj["data"]; ok {
+		ret := map[interface{}]interface{}{}
+		for _, v := range data.([]interface{}) {
+			v := v.([]interface{})
+			ret[v[0]] = v[1]
 		}
 		return ret, nil
 	}

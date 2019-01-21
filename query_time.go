@@ -1,7 +1,7 @@
-package gorethink
+package rethinkdb
 
 import (
-	p "github.com/dancannon/gorethink/ql2"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // Now returns a time object representing the current time in UTC
@@ -21,10 +21,10 @@ func EpochTime(args ...interface{}) Term {
 
 // ISO8601Opts contains the optional arguments for the ISO8601 term
 type ISO8601Opts struct {
-	DefaultTimezone interface{} `gorethink:"default_timezone,omitempty"`
+	DefaultTimezone interface{} `rethinkdb:"default_timezone,omitempty"`
 }
 
-func (o *ISO8601Opts) toMap() map[string]interface{} {
+func (o ISO8601Opts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -53,11 +53,11 @@ func (t Term) Timezone(args ...interface{}) Term {
 
 // DuringOpts contains the optional arguments for the During term
 type DuringOpts struct {
-	LeftBound  interface{} `gorethink:"left_bound,omitempty"`
-	RightBound interface{} `gorethink:"right_bound,omitempty"`
+	LeftBound  interface{} `rethinkdb:"left_bound,omitempty"`
+	RightBound interface{} `rethinkdb:"right_bound,omitempty"`
 }
 
-func (o *DuringOpts) toMap() map[string]interface{} {
+func (o DuringOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 

@@ -1,15 +1,16 @@
-package gorethink
+package rethinkdb
 
 import (
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/cenkalti/backoff"
+	"github.com/hailocab/go-hostpool"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/context"
 )
 
 // A Cluster represents a connection to a RethinkDB cluster, a cluster is created
@@ -23,8 +24,9 @@ type Cluster struct {
 	opts *ConnectOpts
 
 	mu     sync.RWMutex
-	seeds  []Host  // Initial host nodes specified by user.
-	nodes  []*Node // Active nodes in cluster.
+	seeds  []Host // Initial host nodes specified by user.
+	hp     hostpool.HostPool
+	nodes  map[string]*Node // Active nodes in cluster.
 	closed bool
 
 	nodeIndex int64
@@ -33,12 +35,17 @@ type Cluster struct {
 // NewCluster creates a new cluster by connecting to the given hosts.
 func NewCluster(hosts []Host, opts *ConnectOpts) (*Cluster, error) {
 	c := &Cluster{
+		hp:    hostpool.NewEpsilonGreedy([]string{}, opts.HostDecayDuration, &hostpool.LinearEpsilonValueCalculator{}),
 		seeds: hosts,
 		opts:  opts,
 	}
 
-	//Check that hosts in the ClusterConfig is not empty
-	c.connectNodes(c.getSeeds())
+	// Attempt to connect to each host and discover any additional hosts if host
+	// discovery is enabled
+	if err := c.connectNodes(c.getSeeds()); err != nil {
+		return nil, err
+	}
+
 	if !c.IsConnected() {
 		return nil, ErrNoConnectionsStarted
 	}
@@ -51,23 +58,77 @@ func NewCluster(hosts []Host, opts *ConnectOpts) (*Cluster, error) {
 }
 
 // Query executes a ReQL query using the cluster to connect to the database
-func (c *Cluster) Query(q Query) (cursor *Cursor, err error) {
-	node, err := c.GetRandomNode()
-	if err != nil {
-		return nil, err
+func (c *Cluster) Query(ctx context.Context, q Query) (cursor *Cursor, err error) {
+	for i := 0; i < c.numRetries(); i++ {
+		var node *Node
+		var hpr hostpool.HostPoolResponse
+
+		node, hpr, err = c.GetNextNode()
+		if err != nil {
+			return nil, err
+		}
+
+		cursor, err = node.Query(ctx, q)
+		hpr.Mark(err)
+
+		if !shouldRetryQuery(q, err) {
+			break
+		}
 	}
 
-	return node.Query(q)
+	return cursor, err
 }
 
 // Exec executes a ReQL query using the cluster to connect to the database
-func (c *Cluster) Exec(q Query) (err error) {
-	node, err := c.GetRandomNode()
-	if err != nil {
-		return err
+func (c *Cluster) Exec(ctx context.Context, q Query) (err error) {
+	for i := 0; i < c.numRetries(); i++ {
+		var node *Node
+		var hpr hostpool.HostPoolResponse
+
+		node, hpr, err = c.GetNextNode()
+		if err != nil {
+			return err
+		}
+
+		err = node.Exec(ctx, q)
+		hpr.Mark(err)
+
+		if !shouldRetryQuery(q, err) {
+			break
+		}
 	}
 
-	return node.Exec(q)
+	return err
+}
+
+// Server returns the server name and server UUID being used by a connection.
+func (c *Cluster) Server() (response ServerResponse, err error) {
+	for i := 0; i < c.numRetries(); i++ {
+		var node *Node
+		var hpr hostpool.HostPoolResponse
+
+		node, hpr, err = c.GetNextNode()
+		if err != nil {
+			return ServerResponse{}, err
+		}
+
+		response, err = node.Server()
+		hpr.Mark(err)
+
+		// This query should not fail so retry if any error is detected
+		if err == nil {
+			break
+		}
+	}
+
+	return response, err
+}
+
+// SetInitialPoolCap sets the initial capacity of the connection pool.
+func (c *Cluster) SetInitialPoolCap(n int) {
+	for _, node := range c.GetNodes() {
+		node.SetInitialPoolCap(n)
+	}
 }
 
 // SetMaxIdleConns sets the maximum number of connections in the idle
@@ -98,6 +159,7 @@ func (c *Cluster) Close(optArgs ...CloseOpts) error {
 		}
 	}
 
+	c.hp.Close()
 	c.closed = true
 
 	return nil
@@ -120,7 +182,7 @@ func (c *Cluster) discover() {
 
 			return c.listenForNodeChanges()
 		}, b, func(err error, wait time.Duration) {
-			Log.Debugf("Error discovering hosts %s, waiting %s", err, wait)
+			Log.Debugf("Error discovering hosts %s, waiting: %s", err, wait)
 		})
 	}
 }
@@ -129,7 +191,7 @@ func (c *Cluster) discover() {
 // This function will block until the query fails
 func (c *Cluster) listenForNodeChanges() error {
 	// Start listening to changes from a random active node
-	node, err := c.GetRandomNode()
+	node, hpr, err := c.GetNextNode()
 	if err != nil {
 		return err
 	}
@@ -140,18 +202,19 @@ func (c *Cluster) listenForNodeChanges() error {
 		c.opts,
 	)
 	if err != nil {
-		return fmt.Errorf("Error building query %s", err)
+		return fmt.Errorf("Error building query: %s", err)
 	}
 
-	cursor, err := node.Query(q)
+	cursor, err := node.Query(context.Background(), q) // no need for timeout due to Changes()
 	if err != nil {
+		hpr.Mark(err)
 		return err
 	}
 
 	// Keep reading node status updates from changefeed
 	var result struct {
-		NewVal nodeStatus `gorethink:"new_val"`
-		OldVal nodeStatus `gorethink:"old_val"`
+		NewVal nodeStatus `rethinkdb:"new_val"`
+		OldVal nodeStatus `rethinkdb:"old_val"`
 	}
 	for cursor.Next(&result) {
 		addr := fmt.Sprintf("%s:%d", result.NewVal.Network.Hostname, result.NewVal.Network.ReqlPort)
@@ -182,45 +245,52 @@ func (c *Cluster) listenForNodeChanges() error {
 		}
 	}
 
-	return cursor.Err()
+	err = cursor.Err()
+	hpr.Mark(err)
+	return err
 }
 
-func (c *Cluster) connectNodes(hosts []Host) {
+func (c *Cluster) connectNodes(hosts []Host) error {
 	// Add existing nodes to map
 	nodeSet := map[string]*Node{}
 	for _, node := range c.GetNodes() {
 		nodeSet[node.ID] = node
 	}
 
+	var attemptErr error
+
 	// Attempt to connect to each seed host
 	for _, host := range hosts {
 		conn, err := NewConnection(host.String(), c.opts)
 		if err != nil {
-			Log.Warnf("Error creating connection %s", err.Error())
+			attemptErr = err
+			Log.Warnf("Error creating connection: %s", err.Error())
 			continue
 		}
 		defer conn.Close()
 
-		q, err := newQuery(
-			DB("rethinkdb").Table("server_status"),
-			map[string]interface{}{},
-			c.opts,
-		)
-		if err != nil {
-			Log.Warnf("Error building query %s", err)
-			continue
-		}
-
-		_, cursor, err := conn.Query(q)
-		if err != nil {
-			Log.Warnf("Error fetching cluster status %s", err)
-			continue
-		}
-
 		if c.opts.DiscoverHosts {
+			q, err := newQuery(
+				DB("rethinkdb").Table("server_status"),
+				map[string]interface{}{},
+				c.opts,
+			)
+			if err != nil {
+				Log.Warnf("Error building query: %s", err)
+				continue
+			}
+
+			_, cursor, err := conn.Query(nil, q) // nil = connection opts' timeout
+			if err != nil {
+				attemptErr = err
+				Log.Warnf("Error fetching cluster status: %s", err)
+				continue
+			}
+
 			var results []nodeStatus
 			err = cursor.All(&results)
 			if err != nil {
+				attemptErr = err
 				continue
 			}
 
@@ -234,28 +304,50 @@ func (c *Cluster) connectNodes(hosts []Host) {
 						}).Debug("Connected to node")
 						nodeSet[node.ID] = node
 					}
+				} else {
+					attemptErr = err
+					Log.Warnf("Error connecting to node: %s", err)
 				}
 			}
 		} else {
-			node, err := c.connectNode(host.String(), []Host{host})
+			svrRsp, err := conn.Server()
+			if err != nil {
+				attemptErr = err
+				Log.Warnf("Error fetching server ID: %s", err)
+				continue
+			}
+
+			node, err := c.connectNode(svrRsp.ID, []Host{host})
 			if err == nil {
 				if _, ok := nodeSet[node.ID]; !ok {
 					Log.WithFields(logrus.Fields{
 						"id":   node.ID,
 						"host": node.Host.String(),
 					}).Debug("Connected to node")
+
 					nodeSet[node.ID] = node
 				}
+			} else {
+				attemptErr = err
+				Log.Warnf("Error connecting to node: %s", err)
 			}
 		}
+	}
+
+	// If no nodes were contactable then return the last error, this does not
+	// include driver errors such as if there was an issue building the
+	// query
+	if len(nodeSet) == 0 {
+		return attemptErr
 	}
 
 	nodes := []*Node{}
 	for _, node := range nodeSet {
 		nodes = append(nodes, node)
 	}
-
 	c.setNodes(nodes)
+
+	return nil
 }
 
 func (c *Cluster) connectNodeWithStatus(s nodeStatus) (*Node, error) {
@@ -322,44 +414,31 @@ func (c *Cluster) getSeeds() []Host {
 	return seeds
 }
 
-// GetRandomNode returns a random node on the cluster
-// TODO(dancannon) replace with hostpool
-func (c *Cluster) GetRandomNode() (*Node, error) {
+// GetNextNode returns a random node on the cluster
+func (c *Cluster) GetNextNode() (*Node, hostpool.HostPoolResponse, error) {
 	if !c.IsConnected() {
-		return nil, ErrNoConnections
+		return nil, nil, ErrNoConnections
 	}
-	// Must copy array reference for copy on write semantics to work.
-	nodeArray := c.GetNodes()
-	length := len(nodeArray)
-	for i := 0; i < length; i++ {
-		// Must handle concurrency with other non-tending goroutines, so nodeIndex is consistent.
-		index := int(math.Abs(float64(c.nextNodeIndex() % int64(length))))
-		node := nodeArray[index]
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-		if !node.Closed() && node.IsHealthy() {
-			return node, nil
+	nodes := c.nodes
+	hpr := c.hp.Get()
+	if n, ok := nodes[hpr.Host()]; ok {
+		if !n.Closed() {
+			return n, hpr, nil
 		}
 	}
-	return nil, ErrNoConnections
+
+	return nil, nil, ErrNoConnections
 }
 
 // GetNodes returns a list of all nodes in the cluster
 func (c *Cluster) GetNodes() []*Node {
 	c.mu.RLock()
-	nodes := c.nodes
-	c.mu.RUnlock()
-
-	return nodes
-}
-
-// GetHealthyNodes returns a list of all healthy nodes in the cluster
-func (c *Cluster) GetHealthyNodes() []*Node {
-	c.mu.RLock()
-	nodes := []*Node{}
-	for _, node := range c.nodes {
-		if node.IsHealthy() {
-			nodes = append(nodes, node)
-		}
+	nodes := make([]*Node, 0, len(c.nodes))
+	for _, n := range c.nodes {
+		nodes = append(nodes, n)
 	}
 	c.mu.RUnlock()
 
@@ -376,20 +455,34 @@ func (c *Cluster) nodeExists(search *Node) bool {
 }
 
 func (c *Cluster) addNode(node *Node) {
-	c.mu.Lock()
-	c.nodes = append(c.nodes, node)
-	c.mu.Unlock()
+	c.mu.RLock()
+	nodes := append(c.GetNodes(), node)
+	c.mu.RUnlock()
+
+	c.setNodes(nodes)
 }
 
 func (c *Cluster) addNodes(nodesToAdd []*Node) {
-	c.mu.Lock()
-	c.nodes = append(c.nodes, nodesToAdd...)
-	c.mu.Unlock()
+	c.mu.RLock()
+	nodes := append(c.GetNodes(), nodesToAdd...)
+	c.mu.RUnlock()
+
+	c.setNodes(nodes)
 }
 
 func (c *Cluster) setNodes(nodes []*Node) {
+	nodesMap := make(map[string]*Node, len(nodes))
+	hosts := make([]string, len(nodes))
+	for i, node := range nodes {
+		host := node.Host.String()
+
+		nodesMap[host] = node
+		hosts[i] = host
+	}
+
 	c.mu.Lock()
-	c.nodes = nodes
+	c.nodes = nodesMap
+	c.hp.SetHosts(hosts)
 	c.mu.Unlock()
 }
 
@@ -419,4 +512,12 @@ func (c *Cluster) removeNode(nodeID string) {
 
 func (c *Cluster) nextNodeIndex() int64 {
 	return atomic.AddInt64(&c.nodeIndex, 1)
+}
+
+func (c *Cluster) numRetries() int {
+	if n := c.opts.NumRetries; n > 0 {
+		return n
+	}
+
+	return 3
 }

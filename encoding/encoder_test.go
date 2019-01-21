@@ -1,6 +1,7 @@
 package encoding
 
 import (
+	"errors"
 	"image"
 	"reflect"
 	"testing"
@@ -68,35 +69,35 @@ func TestEncode(t *testing.T) {
 }
 
 type Optionals struct {
-	Sr string `gorethink:"sr"`
-	So string `gorethink:"so,omitempty"`
-	Sw string `gorethink:"-"`
+	Sr string `rethinkdb:"sr"`
+	So string `rethinkdb:"so,omitempty"`
+	Sw string `rethinkdb:"-"`
 
-	Ir int `gorethink:"omitempty"` // actually named omitempty, not an option
-	Io int `gorethink:"io,omitempty"`
+	Ir int `rethinkdb:"omitempty"` // actually named omitempty, not an option
+	Io int `rethinkdb:"io,omitempty"`
 
-	Tr time.Time `gorethink:"tr"`
-	To time.Time `gorethink:"to,omitempty"`
+	Tr time.Time `rethinkdb:"tr"`
+	To time.Time `rethinkdb:"to,omitempty"`
 
-	Slr []string `gorethink:"slr"`
-	Slo []string `gorethink:"slo,omitempty"`
+	Slr []string `rethinkdb:"slr"`
+	Slo []string `rethinkdb:"slo,omitempty"`
 
-	Mr map[string]interface{} `gorethink:"mr"`
-	Mo map[string]interface{} `gorethink:",omitempty"`
+	Mr map[string]interface{} `rethinkdb:"mr"`
+	Mo map[string]interface{} `rethinkdb:",omitempty"`
 }
 
 var optionalsExpected = map[string]interface{}{
 	"sr":        "",
 	"omitempty": int64(0),
 	"tr":        map[string]interface{}{"$reql_type$": "TIME", "epoch_time": 0, "timezone": "+00:00"},
-	"slr":       []interface{}{},
+	"slr":       []interface{}(nil),
 	"mr":        map[string]interface{}{},
 }
 
 func TestOmitEmpty(t *testing.T) {
 	var o Optionals
 	o.Sw = "something"
-	o.Tr = time.Unix(0, 0)
+	o.Tr = time.Unix(0, 0).In(time.UTC)
 	o.Mr = map[string]interface{}{}
 	o.Mo = map[string]interface{}{}
 
@@ -210,7 +211,7 @@ func TestEmbeddedBug(t *testing.T) {
 }
 
 type BugD struct { // Same as BugA after tagging.
-	XXX string `gorethink:"S"`
+	XXX string `rethinkdb:"S"`
 }
 
 // BugD's tagged S field should dominate BugA's.
@@ -271,5 +272,278 @@ func TestEncodeMapIntKeys(t *testing.T) {
 	}
 	if !jsonEqual(out, want) {
 		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+type RefA struct {
+	ID string `rethinkdb:"id,omitempty"`
+	B  *RefB  `rethinkdb:"b_id,reference" rethinkdb_ref:"id"`
+}
+
+type RefB struct {
+	ID   string `rethinkdb:"id,omitempty"`
+	Name string `rethinkdb:"name"`
+}
+
+func TestReferenceField(t *testing.T) {
+	input := RefA{"1", &RefB{"2", "Name"}}
+	want := map[string]interface{}{"id": "1", "b_id": "2"}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+type RefC struct {
+	ID string `rethinkdb:"id,omitempty"`
+	B  *RefB  `rethinkdb:"b_id,reference" rethinkdb_ref:"b_id"`
+}
+
+func TestReferenceFieldMissing(t *testing.T) {
+	input := RefC{"1", &RefB{"2", "Name"}}
+
+	_, err := Encode(input)
+	if err == nil {
+		t.Errorf("expected non-nil error but got nil")
+	}
+}
+
+type RefD struct {
+	ID string `rethinkdb:"id,omitempty"`
+	B  string `rethinkdb:"b_id,reference" rethinkdb_ref:"b_id"`
+}
+
+func TestReferenceFieldInvalid(t *testing.T) {
+	input := RefD{"1", "B"}
+
+	_, err := Encode(input)
+	if err == nil {
+		t.Errorf("expected non-nil error but got nil")
+	}
+}
+
+type RefE struct {
+	ID   string  `rethinkdb:"id,omitempty"`
+	FIDs *[]RefF `rethinkdb:"f_ids,reference" rethinkdb_ref:"id"`
+}
+
+type RefF struct {
+	ID   string `rethinkdb:"id,omitempty"`
+	Name string `rethinkdb:"name"`
+}
+
+func TestReferenceFieldArray(t *testing.T) {
+	input := RefE{"1", &[]RefF{RefF{"2", "Name2"}, RefF{"3", "Name3"}}}
+	want := map[string]interface{}{"id": "1", "f_ids": []string{"2", "3"}}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeBytes(t *testing.T) {
+	type BytesStruct struct {
+		A []byte
+		B [1]byte
+	}
+
+	input := BytesStruct{[]byte("A"), [1]byte{'B'}}
+	want := map[string]interface{}{
+		"A": map[string]interface{}{"$reql_type$": "BINARY", "data": "QQ=="},
+		"B": map[string]interface{}{"$reql_type$": "BINARY", "data": "Qg=="},
+	}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+type Compound struct {
+	PartA string `rethinkdb:"id[0]"`
+	PartB string `rethinkdb:"id[1]"`
+	ErrA  string `rethinkdb:"err_a[]"`
+	ErrB  string `rethinkdb:"err_b["`
+	ErrC  string `rethinkdb:"err_c]"`
+}
+
+func TestEncodeCompound(t *testing.T) {
+	input := Compound{"1", "2", "3", "4", "5"}
+	want := map[string]interface{}{"id": []string{"1", "2"}, "err_a[]": "3", "err_b[": "4", "err_c]": "5"}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+type CompoundRef struct {
+	PartA string `rethinkdb:"id[0]"`
+	PartB *RefB  `rethinkdb:"id[1],reference" rethinkdb_ref:"id"`
+}
+
+func TestEncodeCompoundRef(t *testing.T) {
+	input := CompoundRef{"1", &RefB{"2", "Name"}}
+	want := map[string]interface{}{"id": []string{"1", "2"}}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeNilSlice(t *testing.T) {
+	input := SliceStruct{}
+	want := map[string]interface{}{"X": []string(nil)}
+
+	out, err := Encode(input)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeCustomTypeEncodingValue(t *testing.T) {
+	type innerType struct {
+		Val int
+	}
+
+	outer := struct {
+		Inner innerType `rethinkdb:"inner"`
+	}{Inner: innerType{Val: 5}}
+	want := map[string]interface{}{
+		"inner": map[string]interface{}{
+			"someval": 5,
+		},
+	}
+
+	SetTypeEncoding(reflect.TypeOf(innerType{}),
+		func(v interface{}) (interface{}, error) {
+			return map[string]interface{}{"someval": v.(innerType).Val}, nil
+		}, nil)
+
+	out, err := Encode(outer)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeCustomTypeEncodingPointer(t *testing.T) {
+	type innerType struct {
+		Val int
+	}
+
+	outer := struct {
+		Inner *innerType `rethinkdb:"inner"`
+	}{Inner: &innerType{Val: 5}}
+	want := map[string]interface{}{
+		"inner": map[string]interface{}{
+			"someval": 5,
+		},
+	}
+
+	SetTypeEncoding(reflect.TypeOf((*innerType)(nil)),
+		func(v interface{}) (interface{}, error) {
+			return map[string]interface{}{"someval": v.(*innerType).Val}, nil
+		}, nil)
+
+	out, err := Encode(outer)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeCustomRootTypeEncodingValue(t *testing.T) {
+	type cType struct {
+		Val int
+	}
+	in := cType{Val: 5}
+
+	want := map[string]interface{}{
+		"someval": 5,
+	}
+
+	SetTypeEncoding(reflect.TypeOf(cType{}),
+		func(v interface{}) (interface{}, error) {
+			return map[string]interface{}{"someval": v.(cType).Val}, nil
+		}, nil)
+
+	out, err := Encode(in)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeCustomRootTypeEncodingPointer(t *testing.T) {
+	type cType struct {
+		Val int
+	}
+	in := cType{Val: 5}
+
+	want := map[string]interface{}{
+		"someval": 5,
+	}
+
+	SetTypeEncoding(reflect.TypeOf((*cType)(nil)),
+		func(v interface{}) (interface{}, error) {
+			return map[string]interface{}{"someval": v.(*cType).Val}, nil
+		}, nil)
+
+	out, err := Encode(&in)
+	if err != nil {
+		t.Errorf("got error %v, expected nil", err)
+	}
+	if !jsonEqual(out, want) {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestEncodeCustomRootTypeEncodingError(t *testing.T) {
+	type cType struct {
+		Val int
+	}
+	in := cType{Val: 5}
+
+	cerr := errors.New("encode error")
+
+	SetTypeEncoding(reflect.TypeOf((*cType)(nil)),
+		func(v interface{}) (interface{}, error) {
+			return nil, cerr
+		}, nil)
+
+	_, err := Encode(&in)
+	if err == nil {
+		t.Errorf("got nil error, expected %v", cerr)
+	}
+	if err != cerr {
+		t.Errorf("got %q, want %q", err, cerr)
 	}
 }

@@ -1,30 +1,43 @@
-package gorethink
+package rethinkdb
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"reflect"
 	"sync"
 
-	"github.com/dancannon/gorethink/encoding"
-	p "github.com/dancannon/gorethink/ql2"
+	"github.com/opentracing/opentracing-go"
+	"golang.org/x/net/context"
+	"gopkg.in/rethinkdb/rethinkdb-go.v5/encoding"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 var (
+	errNilCursor    = errors.New("cursor is nil")
 	errCursorClosed = errors.New("connection closed, cannot read cursor")
 )
 
-func newCursor(conn *Connection, cursorType string, token int64, term *Term, opts map[string]interface{}) *Cursor {
+func newCursor(ctx context.Context, conn *Connection, cursorType string, token int64, term *Term, opts map[string]interface{}) *Cursor {
 	if cursorType == "" {
 		cursorType = "Cursor"
 	}
 
+	connOpts := &ConnectOpts{}
+	if conn != nil {
+		connOpts = conn.opts
+	}
+
 	cursor := &Cursor{
 		conn:       conn,
+		connOpts:   connOpts,
 		token:      token,
 		cursorType: cursorType,
 		term:       term,
 		opts:       opts,
+		buffer:     make([]interface{}, 0),
+		responses:  make([]json.RawMessage, 0),
+		ctx:        ctx,
 	}
 
 	return cursor
@@ -46,27 +59,35 @@ func newCursor(conn *Connection, cursorType string, token int64, term *Term, opt
 //     err = cursor.Err() // get any error encountered during iteration
 //     ...
 type Cursor struct {
-	releaseConn func(error)
+	releaseConn func() error
 
 	conn       *Connection
+	connOpts   *ConnectOpts
 	token      int64
 	cursorType string
 	term       *Term
 	opts       map[string]interface{}
+	ctx        context.Context
 
-	mu        sync.RWMutex
-	lastErr   error
-	fetching  bool
-	closed    bool
-	finished  bool
-	isAtom    bool
-	buffer    queue
-	responses queue
-	profile   interface{}
+	mu            sync.RWMutex
+	lastErr       error
+	fetching      bool
+	closed        bool
+	finished      bool
+	isAtom        bool
+	isSingleValue bool
+	pendingSkips  int
+	buffer        []interface{}
+	responses     []json.RawMessage
+	profile       interface{}
 }
 
 // Profile returns the information returned from the query profiler.
 func (c *Cursor) Profile() interface{} {
+	if c == nil {
+		return nil
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -75,6 +96,10 @@ func (c *Cursor) Profile() interface{} {
 
 // Type returns the cursor type (by default "Cursor")
 func (c *Cursor) Type() string {
+	if c == nil {
+		return "Cursor"
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -84,6 +109,10 @@ func (c *Cursor) Type() string {
 // Err returns nil if no errors happened during iteration, or the actual
 // error otherwise.
 func (c *Cursor) Err() error {
+	if c == nil {
+		return errNilCursor
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -93,10 +122,14 @@ func (c *Cursor) Err() error {
 // Close closes the cursor, preventing further enumeration. If the end is
 // encountered, the cursor is closed automatically. Close is idempotent.
 func (c *Cursor) Close() error {
-	var err error
+	if c == nil {
+		return errNilCursor
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	var err error
 
 	// If cursor is already closed return immediately
 	closed := c.closed
@@ -110,28 +143,29 @@ func (c *Cursor) Close() error {
 	if conn == nil {
 		return nil
 	}
-	if conn.conn == nil {
+	if conn.Conn == nil {
 		return nil
 	}
 
 	// Stop any unfinished queries
 	if !c.finished {
-		q := Query{
-			Type:  p.Query_STOP,
-			Token: c.token,
-		}
-
-		_, _, err = conn.Query(q)
+		_, _, err = conn.Query(c.ctx, newStopQuery(c.token))
 	}
 
 	if c.releaseConn != nil {
-		c.releaseConn(err)
+		if err := c.releaseConn(); err != nil {
+			return err
+		}
+	}
+
+	if span := opentracing.SpanFromContext(c.ctx); span != nil {
+		span.Finish()
 	}
 
 	c.closed = true
 	c.conn = nil
-	c.buffer.elems = nil
-	c.responses.elems = nil
+	c.buffer = nil
+	c.responses = nil
 
 	return err
 }
@@ -149,13 +183,17 @@ func (c *Cursor) Close() error {
 // Also note that you are able to reuse the same variable multiple times as
 // `Next` zeroes the value before scanning in the result.
 func (c *Cursor) Next(dest interface{}) bool {
+	if c == nil {
+		return false
+	}
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return false
 	}
 
-	hasMore, err := c.loadNextLocked(dest)
+	hasMore, err := c.nextLocked(dest, true)
 	if c.handleErrorLocked(err) != nil {
 		c.mu.Unlock()
 		c.Close()
@@ -170,58 +208,25 @@ func (c *Cursor) Next(dest interface{}) bool {
 	return hasMore
 }
 
-func (c *Cursor) loadNextLocked(dest interface{}) (bool, error) {
+func (c *Cursor) nextLocked(dest interface{}, progressCursor bool) (bool, error) {
 	for {
-		if c.lastErr != nil {
-			return false, c.lastErr
+		if err := c.seekCursor(true); err != nil {
+			return false, err
 		}
 
-		// Check if response is closed/finished
-		if c.buffer.Len() == 0 && c.responses.Len() == 0 && c.closed {
-			return false, errCursorClosed
-		}
-
-		if c.buffer.Len() == 0 && c.responses.Len() == 0 && !c.finished {
-			c.mu.Unlock()
-			err := c.fetchMore()
-			if err != nil {
-				return false, err
-			}
-			c.mu.Lock()
-		}
-
-		if c.buffer.Len() == 0 && c.responses.Len() == 0 && c.finished {
+		if c.closed {
 			return false, nil
 		}
 
-		if c.buffer.Len() == 0 && c.responses.Len() > 0 {
-			if response, ok := c.responses.Pop().(json.RawMessage); ok {
-				var value interface{}
-				err := json.Unmarshal(response, &value)
-				if err != nil {
-					return false, err
-				}
-
-				value, err = recursivelyConvertPseudotype(value, c.opts)
-				if err != nil {
-					return false, err
-				}
-
-				// If response is an ATOM then try and convert to an array
-				if data, ok := value.([]interface{}); ok && c.isAtom {
-					for _, v := range data {
-						c.buffer.Push(v)
-					}
-				} else if value == nil {
-					c.buffer.Push(nil)
-				} else {
-					c.buffer.Push(value)
-				}
-			}
+		if len(c.buffer) == 0 && c.finished {
+			return false, nil
 		}
 
-		if c.buffer.Len() > 0 {
-			data := c.buffer.Pop()
+		if len(c.buffer) > 0 {
+			data := c.buffer[0]
+			if progressCursor {
+				c.buffer = c.buffer[1:]
+			}
 
 			err := encoding.Decode(dest, data)
 			if err != nil {
@@ -229,6 +234,114 @@ func (c *Cursor) loadNextLocked(dest interface{}) (bool, error) {
 			}
 
 			return true, nil
+		}
+	}
+}
+
+// Peek behaves similarly to Next, retreiving the next document from the result set
+// and blocking if necessary. Peek, however, does not progress the position of the cursor.
+// This can be useful for expressions which can return different types to attempt to
+// decode them into different interfaces.
+//
+// Like Next, it will also automatically retrieve another batch of documents from
+// the server when the current one is exhausted, or before that in background
+// if possible.
+//
+// Unlike Next, Peek does not progress the position of the cursor. Peek
+// will return errors from decoding, but they will not be persisted in the cursor
+// and therefore will not be available on cursor.Err(). This can be useful for
+// expressions that can return different types to attempt to decode them into
+// different interfaces.
+//
+// Peek returns true if a document was successfully unmarshalled onto result,
+// and false at the end of the result set or if an error happened. Peek also
+// returns the error (if any) that occured
+func (c *Cursor) Peek(dest interface{}) (bool, error) {
+	if c == nil {
+		return false, errNilCursor
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false, nil
+	}
+
+	hasMore, err := c.nextLocked(dest, false)
+	if _, isDecodeErr := err.(*encoding.DecodeTypeError); isDecodeErr {
+		c.mu.Unlock()
+		return false, err
+	}
+
+	if c.handleErrorLocked(err) != nil {
+		c.mu.Unlock()
+		c.Close()
+		return false, err
+	}
+	c.mu.Unlock()
+
+	return hasMore, nil
+}
+
+// Skip progresses the cursor by one record. It is useful after a successful
+// Peek to avoid duplicate decoding work.
+func (c *Cursor) Skip() {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pendingSkips++
+}
+
+// NextResponse retrieves the next raw response from the result set, blocking if necessary.
+// Unlike Next the returned response is the raw JSON document returned from the
+// database.
+//
+// NextResponse returns false (and a nil byte slice) at the end of the result
+// set or if an error happened.
+func (c *Cursor) NextResponse() ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, false
+	}
+
+	b, hasMore, err := c.nextResponseLocked()
+	if c.handleErrorLocked(err) != nil {
+		c.mu.Unlock()
+		c.Close()
+		return nil, false
+	}
+	c.mu.Unlock()
+
+	if !hasMore {
+		c.Close()
+	}
+
+	return b, hasMore
+}
+
+func (c *Cursor) nextResponseLocked() ([]byte, bool, error) {
+	for {
+		if err := c.seekCursor(false); err != nil {
+			return nil, false, err
+		}
+
+		if len(c.responses) == 0 && c.finished {
+			return nil, false, nil
+		}
+
+		if len(c.responses) > 0 {
+			var response json.RawMessage
+			response, c.responses = c.responses[0], c.responses[1:]
+
+			return []byte(response), true, nil
 		}
 	}
 }
@@ -244,6 +357,10 @@ func (c *Cursor) loadNextLocked(dest interface{}) (bool, error) {
 // to reuse the existing slice without allocating any more space by either
 // resizing or returning a selection of the slice if necessary.
 func (c *Cursor) All(result interface{}) error {
+	if c == nil {
+		return errNilCursor
+	}
+
 	resultv := reflect.ValueOf(result)
 	if resultv.Kind() != reflect.Ptr || resultv.Elem().Kind() != reflect.Slice {
 		panic("result argument must be a slice address")
@@ -287,6 +404,10 @@ func (c *Cursor) All(result interface{}) error {
 // Also note that you are able to reuse the same variable multiple times as
 // `One` zeroes the value before scanning in the result.
 func (c *Cursor) One(result interface{}) error {
+	if c == nil {
+		return errNilCursor
+	}
+
 	if c.IsNil() {
 		c.Close()
 		return ErrEmptyResult
@@ -308,6 +429,41 @@ func (c *Cursor) One(result interface{}) error {
 	}
 
 	return nil
+}
+
+// Interface retrieves all documents from the result set and returns the data
+// as an interface{} and closes the cursor.
+//
+// If the query returns multiple documents then a slice will be returned,
+// otherwise a single value will be returned.
+func (c *Cursor) Interface() (interface{}, error) {
+	if c == nil {
+		return nil, errNilCursor
+	}
+
+	var results []interface{}
+	var result interface{}
+	for c.Next(&result) {
+		results = append(results, result)
+	}
+
+	if err := c.Err(); err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	isSingleValue := c.isSingleValue
+	c.mu.RUnlock()
+
+	if isSingleValue {
+		if len(results) == 0 {
+			return nil, nil
+		}
+
+		return results[0], nil
+	}
+
+	return results, nil
 }
 
 // Listen listens for rows from the database and sends the result onto the given
@@ -349,28 +505,25 @@ func (c *Cursor) Listen(channel interface{}) {
 
 // IsNil tests if the current row is nil.
 func (c *Cursor) IsNil() bool {
+	if c == nil {
+		return true
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.buffer.Len() > 0 {
-		bufferedItem := c.buffer.Peek()
-		if bufferedItem == nil {
-			return true
-		}
-
-		return false
+	if len(c.buffer) > 0 {
+		return c.buffer[0] == nil
 	}
 
-	if c.responses.Len() > 0 {
-		response := c.responses.Peek()
+	if len(c.responses) > 0 {
+		response := c.responses[0]
 		if response == nil {
 			return true
 		}
 
-		if response, ok := response.(json.RawMessage); ok {
-			if string(response) == "null" {
-				return true
-			}
+		if string(response) == "null" {
+			return true
 		}
 
 		return false
@@ -386,15 +539,10 @@ func (c *Cursor) IsNil() bool {
 func (c *Cursor) fetchMore() error {
 	var err error
 
-	c.mu.Lock()
-	fetching := c.fetching
-	closed := c.closed
-
-	if !fetching {
+	if !c.fetching {
 		c.fetching = true
-		c.mu.Unlock()
 
-		if closed {
+		if c.closed {
 			return errCursorClosed
 		}
 
@@ -403,9 +551,9 @@ func (c *Cursor) fetchMore() error {
 			Token: c.token,
 		}
 
-		_, _, err = c.conn.Query(q)
-	} else {
 		c.mu.Unlock()
+		_, _, err = c.conn.Query(c.ctx, q)
+		c.mu.Lock()
 	}
 
 	return err
@@ -436,77 +584,125 @@ func (c *Cursor) extend(response *Response) {
 }
 
 func (c *Cursor) extendLocked(response *Response) {
-	for _, response := range response.Responses {
-		c.responses.Push(response)
-	}
-
+	c.responses = append(c.responses, response.Responses...)
 	c.finished = response.Type != p.Response_SUCCESS_PARTIAL
 	c.fetching = false
 	c.isAtom = response.Type == p.Response_SUCCESS_ATOM
-
-	putResponse(response)
 }
 
-// Queue structure used for storing responses
-
-type queue struct {
-	elems               []interface{}
-	nelems, popi, pushi int
-}
-
-func (q *queue) Len() int {
-	if len(q.elems) == 0 {
-		return 0
+// seekCursor takes care of loading more data if needed and applying pending skips
+//
+// bufferResponse determines whether the response will be parsed into the buffer
+func (c *Cursor) seekCursor(bufferResponse bool) error {
+	if c.lastErr != nil {
+		return c.lastErr
 	}
 
-	return q.nelems
-}
-func (q *queue) Push(elem interface{}) {
-	if q.nelems == len(q.elems) {
-		q.expand()
+	if len(c.buffer) == 0 && len(c.responses) == 0 && c.closed {
+		return errCursorClosed
 	}
-	q.elems[q.pushi] = elem
-	q.nelems++
-	q.pushi = (q.pushi + 1) % len(q.elems)
-}
-func (q *queue) Pop() (elem interface{}) {
-	if q.nelems == 0 {
+
+	// Loop over loading data, applying skips as necessary and loading more data as needed
+	// until either the cursor is closed or finished, or we have applied all outstanding
+	// skips and data is available
+	for {
+		c.applyPendingSkips(bufferResponse) // if we are buffering the responses, skip can drain from the buffer
+
+		if bufferResponse && len(c.buffer) == 0 && len(c.responses) > 0 {
+			if err := c.bufferNextResponse(); err != nil {
+				return err
+			}
+			continue // go around the loop again to re-apply pending skips
+		} else if len(c.buffer) == 0 && len(c.responses) == 0 && !c.finished {
+			//  We skipped all of our data, load some more
+			if err := c.fetchMore(); err != nil {
+				return err
+			}
+			if c.closed {
+				return nil
+			}
+			continue // go around the loop again to re-apply pending skips
+		}
 		return nil
 	}
-	elem = q.elems[q.popi]
-	q.elems[q.popi] = nil // Help GC.
-	q.nelems--
-	q.popi = (q.popi + 1) % len(q.elems)
-	return elem
 }
-func (q *queue) Peek() (elem interface{}) {
-	if q.nelems == 0 {
+
+// applyPendingSkips applies all pending skips to the buffer and
+// returns whether there are more pending skips to be applied
+//
+// if drainFromBuffer is true, we will drain from the buffer, otherwise
+// we drain from the responses
+func (c *Cursor) applyPendingSkips(drainFromBuffer bool) (stillPending bool) {
+	if c.pendingSkips == 0 {
+		return false
+	}
+
+	if drainFromBuffer {
+		if len(c.buffer) > c.pendingSkips {
+			c.buffer = c.buffer[c.pendingSkips:]
+			c.pendingSkips = 0
+			return false
+		}
+
+		c.pendingSkips -= len(c.buffer)
+		c.buffer = c.buffer[:0]
+		return c.pendingSkips > 0
+	}
+
+	if len(c.responses) > c.pendingSkips {
+		c.responses = c.responses[c.pendingSkips:]
+		c.pendingSkips = 0
+		return false
+	}
+
+	c.pendingSkips -= len(c.responses)
+	c.responses = c.responses[:0]
+	return c.pendingSkips > 0
+}
+
+// bufferResponse reads a single response and stores the result into the buffer
+// if the response is from an atomic response, it will check if the
+// response contains multiple records and store them all into the buffer
+func (c *Cursor) bufferNextResponse() error {
+	if c.closed {
+		return errCursorClosed
+	}
+	// If there are no responses, nothing to do
+	if len(c.responses) == 0 {
 		return nil
 	}
-	return q.elems[q.popi]
-}
-func (q *queue) expand() {
-	curcap := len(q.elems)
-	var newcap int
-	if curcap == 0 {
-		newcap = 8
-	} else if curcap < 1024 {
-		newcap = curcap * 2
+
+	response := c.responses[0]
+	c.responses = c.responses[1:]
+
+	var value interface{}
+	decoder := json.NewDecoder(bytes.NewBuffer(response))
+	if c.connOpts.UseJSONNumber {
+		decoder.UseNumber()
+	}
+	err := decoder.Decode(&value)
+	if err != nil {
+		return err
+	}
+
+	value, err = recursivelyConvertPseudotype(value, c.opts)
+	if err != nil {
+		return err
+	}
+
+	// If response is an ATOM then try and convert to an array
+	if data, ok := value.([]interface{}); ok && c.isAtom {
+		c.buffer = append(c.buffer, data...)
+	} else if value == nil {
+		c.buffer = append(c.buffer, nil)
 	} else {
-		newcap = curcap + (curcap / 4)
+		c.buffer = append(c.buffer, value)
+
+		// If this is the only value in the response and the response was an
+		// atom then set the single value flag
+		if c.isAtom {
+			c.isSingleValue = true
+		}
 	}
-	elems := make([]interface{}, newcap)
-	if q.popi == 0 {
-		copy(elems, q.elems)
-		q.pushi = curcap
-	} else {
-		newpopi := newcap - (curcap - q.popi)
-		copy(elems, q.elems[:q.popi])
-		copy(elems[newpopi:], q.elems[q.popi:])
-		q.popi = newpopi
-	}
-	for i := range q.elems {
-		q.elems[i] = nil // Help GC.
-	}
-	q.elems = elems
+	return nil
 }

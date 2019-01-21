@@ -1,4 +1,4 @@
-package gorethink
+package rethinkdb
 
 import (
 	"reflect"
@@ -6,9 +6,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/dancannon/gorethink/encoding"
-
-	p "github.com/dancannon/gorethink/ql2"
+	"gopkg.in/rethinkdb/rethinkdb-go.v5/encoding"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // Helper functions for constructing terms
@@ -44,19 +43,19 @@ func constructMethodTerm(prevVal Term, name string, termType p.Term_TermType, ar
 func newQuery(t Term, qopts map[string]interface{}, copts *ConnectOpts) (q Query, err error) {
 	queryOpts := map[string]interface{}{}
 	for k, v := range qopts {
-		queryOpts[k], err = Expr(v).build()
+		queryOpts[k], err = Expr(v).Build()
 		if err != nil {
 			return
 		}
 	}
 	if copts.Database != "" {
-		queryOpts["db"], err = DB(copts.Database).build()
+		queryOpts["db"], err = DB(copts.Database).Build()
 		if err != nil {
 			return
 		}
 	}
 
-	builtTerm, err := t.build()
+	builtTerm, err := t.Build()
 	if err != nil {
 		return q, err
 	}
@@ -98,13 +97,14 @@ func makeFunc(f interface{}) Term {
 	var args = make([]reflect.Value, valueType.NumIn())
 	for i := 0; i < valueType.NumIn(); i++ {
 		// Get a slice of the VARs to use as the function arguments
-		args[i] = reflect.ValueOf(constructRootTerm("var", p.Term_VAR, []interface{}{nextVarID}, map[string]interface{}{}))
-		argNums[i] = nextVarID
-		atomic.AddInt64(&nextVarID, 1)
+		varID := atomic.AddInt64(&nextVarID, 1)
+		args[i] = reflect.ValueOf(constructRootTerm("var", p.Term_VAR, []interface{}{varID}, map[string]interface{}{}))
+		argNums[i] = varID
 
 		// make sure all input arguments are of type Term
-		if valueType.In(i).String() != "gorethink.Term" {
-			panic("Function argument is not of type Term")
+		argValueTypeName := valueType.In(i).String()
+		if argValueTypeName != "rethinkdb.Term" && argValueTypeName != "interface {}" {
+			panic("Function argument is not of type Term or interface {}")
 		}
 	}
 
@@ -173,6 +173,10 @@ func optArgsToMap(optArgs OptArgs) map[string]interface{} {
 
 // Convert a list into a slice of terms
 func convertTermList(l []interface{}) termsList {
+	if len(l) == 0 {
+		return nil
+	}
+
 	terms := make(termsList, len(l))
 	for i, v := range l {
 		terms[i] = Expr(v)
@@ -183,6 +187,10 @@ func convertTermList(l []interface{}) termsList {
 
 // Convert a map into a map of terms
 func convertTermObj(o map[string]interface{}) termsObj {
+	if len(o) == 0 {
+		return nil
+	}
+
 	terms := make(termsObj, len(o))
 	for k, v := range o {
 		terms[k] = Expr(v)
@@ -258,4 +266,18 @@ func encode(data interface{}) (interface{}, error) {
 	}
 
 	return v, nil
+}
+
+// shouldRetryQuery checks the result of a query and returns true if the query
+// should be retried
+func shouldRetryQuery(q Query, err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if _, ok := err.(RQLConnectionError); ok {
+		return true
+	}
+
+	return err == ErrConnectionClosed
 }

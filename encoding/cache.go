@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 )
 
 // A field represents a single field found in a struct.
@@ -14,11 +15,15 @@ type field struct {
 	nameBytes []byte // []byte(name)
 	equalFold func(s, t []byte) bool
 
-	tag       bool
-	index     []int
-	typ       reflect.Type
-	omitEmpty bool
-	quoted    bool
+	tag           bool
+	index         []int
+	typ           reflect.Type
+	omitEmpty     bool
+	quoted        bool
+	reference     bool
+	refName       string
+	compound      bool
+	compoundIndex int
 }
 
 func fillField(f field) field {
@@ -100,17 +105,26 @@ func typeFields(t reflect.Type) []field {
 			// Scan f.typ for fields to include.
 			for i := 0; i < f.typ.NumField(); i++ {
 				sf := f.typ.Field(i)
-				if sf.PkgPath != "" { // unexported
+				if sf.PkgPath != "" && !sf.Anonymous { // unexported
 					continue
 				}
+				// Extract field name from tag
 				tag := getTag(sf)
 				if tag == "-" {
 					continue
 				}
 				name, opts := parseTag(tag)
+				name, compoundIndex, isCompound := parseCompoundIndex(name)
 				if !isValidTag(name) {
 					name = ""
 				}
+				// Extract referenced field from tags
+				refTag := getRefTag(sf)
+				ref, _ := parseTag(refTag)
+				if !isValidTag(ref) {
+					ref = ""
+				}
+
 				index := make([]int, len(f.index)+1)
 				copy(index, f.index)
 				index[len(f.index)] = i
@@ -122,17 +136,21 @@ func typeFields(t reflect.Type) []field {
 				}
 
 				// Record found field and index sequence.
-				if name != "" || !sf.Anonymous || ft.Kind() != reflect.Struct {
+				if name != "" || !sf.Anonymous || ft.Kind() != reflect.Struct || isPseudoType(ft) {
 					tagged := name != ""
 					if name == "" {
 						name = sf.Name
 					}
 					fields = append(fields, fillField(field{
-						name:      name,
-						tag:       tagged,
-						index:     index,
-						typ:       ft,
-						omitEmpty: opts.Contains("omitempty"),
+						name:          name,
+						tag:           tagged,
+						index:         index,
+						typ:           ft,
+						omitEmpty:     opts.Contains("omitempty"),
+						reference:     opts.Contains("reference"),
+						refName:       ref,
+						compound:      isCompound,
+						compoundIndex: compoundIndex,
 					}))
 					if count[f.typ] > 1 {
 						// If there were multiple instances, add a second,
@@ -166,12 +184,15 @@ func typeFields(t reflect.Type) []field {
 		// One iteration per name.
 		// Find the sequence of fields with the name of this first field.
 		fi := fields[i]
-		name := fi.name
 		for advance = 1; i+advance < len(fields); advance++ {
 			fj := fields[i+advance]
-			if fj.name != name {
+			if fj.name != fi.name {
 				break
 			}
+			if fi.compound && fj.compound && fi.compoundIndex != fj.compoundIndex {
+				break
+			}
+
 		}
 		if advance == 1 { // Only one field with this name
 			out = append(out, fi)
@@ -187,6 +208,10 @@ func typeFields(t reflect.Type) []field {
 	sort.Sort(byIndex(fields))
 
 	return fields
+}
+
+func isPseudoType(t reflect.Type) bool {
+	return t == reflect.TypeOf(time.Time{})
 }
 
 // dominantField looks through the fields, all of which are known to

@@ -1,7 +1,7 @@
-package gorethink
+package rethinkdb
 
 import (
-	p "github.com/dancannon/gorethink/ql2"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // DB references a database.
@@ -11,12 +11,12 @@ func DB(args ...interface{}) Term {
 
 // TableOpts contains the optional arguments for the Table term
 type TableOpts struct {
-	ReadMode         interface{} `gorethink:"read_mode,omitempty"`
-	UseOutdated      interface{} `gorethink:"use_outdated,omitempty"` // Deprecated
-	IdentifierFormat interface{} `gorethink:"identifier_format,omitempty"`
+	ReadMode         interface{} `rethinkdb:"read_mode,omitempty"`
+	UseOutdated      interface{} `rethinkdb:"use_outdated,omitempty"` // Deprecated
+	IdentifierFormat interface{} `rethinkdb:"identifier_format,omitempty"`
 }
 
-func (o *TableOpts) toMap() map[string]interface{} {
+func (o TableOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -61,7 +61,19 @@ func (t Term) Get(args ...interface{}) Term {
 	return constructMethodTerm(t, "Get", p.Term_GET, args, map[string]interface{}{})
 }
 
-// GetAll gets all documents where the given value matches the value of the primary index.
+// GetAllOpts contains the optional arguments for the GetAll term
+type GetAllOpts struct {
+	Index interface{} `rethinkdb:"index,omitempty"`
+}
+
+func (o GetAllOpts) toMap() map[string]interface{} {
+	return optArgsToMap(o)
+}
+
+// GetAll gets all documents where the given value matches the value of the primary
+// index. Multiple values can be passed this function if you want to select multiple
+// documents. If the documents you are fetching have composite keys then each
+// argument should be a slice. For more information see the examples.
 func (t Term) GetAll(keys ...interface{}) Term {
 	return constructMethodTerm(t, "GetAll", p.Term_GET_ALL, keys, map[string]interface{}{})
 }
@@ -74,12 +86,12 @@ func (t Term) GetAllByIndex(index interface{}, keys ...interface{}) Term {
 
 // BetweenOpts contains the optional arguments for the Between term
 type BetweenOpts struct {
-	Index      interface{} `gorethink:"index,omitempty"`
-	LeftBound  interface{} `gorethink:"left_bound,omitempty"`
-	RightBound interface{} `gorethink:"right_bound,omitempty"`
+	Index      interface{} `rethinkdb:"index,omitempty"`
+	LeftBound  interface{} `rethinkdb:"left_bound,omitempty"`
+	RightBound interface{} `rethinkdb:"right_bound,omitempty"`
 }
 
-func (o *BetweenOpts) toMap() map[string]interface{} {
+func (o BetweenOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -105,10 +117,10 @@ func (t Term) Between(lowerKey, upperKey interface{}, optArgs ...BetweenOpts) Te
 
 // FilterOpts contains the optional arguments for the Filter term
 type FilterOpts struct {
-	Default interface{} `gorethink:"default,omitempty"`
+	Default interface{} `rethinkdb:"default,omitempty"`
 }
 
-func (o *FilterOpts) toMap() map[string]interface{} {
+func (o FilterOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 

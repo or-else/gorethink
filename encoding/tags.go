@@ -4,18 +4,51 @@ package encoding
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"unicode"
 )
 
-const TagName = "gorethink"
+var (
+	Tags []string
+)
+
+const (
+	TagName       = "rethinkdb"
+	OldTagName    = "gorethink"
+	JSONTagName   = "json"
+	RefTagName    = "rethinkdb_ref"
+	OldRefTagName = "gorethink_ref"
+)
 
 // tagOptions is the string following a comma in a struct field's
 // tag, or the empty string. It does not include the leading comma.
 type tagOptions string
 
 func getTag(sf reflect.StructField) string {
-	return sf.Tag.Get(TagName)
+	if Tags == nil {
+		value := sf.Tag.Get(TagName)
+		if value == "" {
+			return sf.Tag.Get(OldTagName)
+		}
+		return value
+	}
+
+	for _, tagName := range Tags {
+		if tag := sf.Tag.Get(tagName); tag != "" {
+			return tag
+		}
+	}
+
+	return ""
+}
+
+func getRefTag(sf reflect.StructField) string {
+	value := sf.Tag.Get(RefTagName)
+	if value == "" {
+		return sf.Tag.Get(OldRefTagName)
+	}
+	return value
 }
 
 // parseTag splits a struct field's tag into its name and
@@ -25,6 +58,18 @@ func parseTag(tag string) (string, tagOptions) {
 		return tag[:idx], tagOptions(tag[idx+1:])
 	}
 	return tag, tagOptions("")
+}
+
+func parseCompoundIndex(tag string) (string, int, bool) {
+	lIdx := strings.Index(tag, "[")
+	rIdx := strings.Index(tag, "]")
+	if lIdx > 1 && rIdx > lIdx+1 {
+		if elemIndex_, err := strconv.ParseInt(tag[lIdx+1:rIdx], 10, 64); err == nil {
+			return tag[:lIdx], int(elemIndex_), true
+		}
+	}
+
+	return tag, 0, false
 }
 
 func isValidTag(s string) bool {

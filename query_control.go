@@ -1,11 +1,12 @@
-package gorethink
+package rethinkdb
 
 import (
 	"encoding/base64"
+	"encoding/json"
 
 	"reflect"
 
-	p "github.com/dancannon/gorethink/ql2"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // Expr converts any value to an expression and is also used by many other terms
@@ -19,21 +20,21 @@ import (
 //  - the field is empty and its tag specifies the "omitempty" option.
 //
 // Each fields default name in the map is the field name but can be specified
-// in the struct field's tag value. The "gorethink" key in the struct field's
+// in the struct field's tag value. The "rethinkdb" key in the struct field's
 // tag value is the key name, followed by an optional comma and options. Examples:
 //
 //   // Field is ignored by this package.
-//   Field int `gorethink:"-"`
+//   Field int `rethinkdb:"-"`
 //   // Field appears as key "myName".
-//   Field int `gorethink:"myName"`
+//   Field int `rethinkdb:"myName"`
 //   // Field appears as key "myName" and
 //   // the field is omitted from the object if its value is empty,
 //   // as defined above.
-//   Field int `gorethink:"myName,omitempty"`
+//   Field int `rethinkdb:"myName,omitempty"`
 //   // Field appears as key "Field" (the default), but
 //   // the field is skipped if empty.
 //   // Note the leading comma.
-//   Field int `gorethink:",omitempty"`
+//   Field int `rethinkdb:",omitempty"`
 func Expr(val interface{}) Term {
 	if val == nil {
 		return Term{
@@ -59,6 +60,41 @@ func Expr(val interface{}) Term {
 		}
 
 		return makeObject(vals)
+	case
+		bool,
+		int,
+		int8,
+		int16,
+		int32,
+		int64,
+		uint,
+		uint8,
+		uint16,
+		uint32,
+		uint64,
+		float32,
+		float64,
+		uintptr,
+		string,
+		*bool,
+		*int,
+		*int8,
+		*int16,
+		*int32,
+		*int64,
+		*uint,
+		*uint8,
+		*uint16,
+		*uint32,
+		*uint64,
+		*float32,
+		*float64,
+		*uintptr,
+		*string:
+		return Term{
+			termType: p.Term_DATUM,
+			data:     val,
+		}
 	default:
 		// Use reflection to check for other types
 		valType := reflect.TypeOf(val)
@@ -67,7 +103,7 @@ func Expr(val interface{}) Term {
 		switch valType.Kind() {
 		case reflect.Func:
 			return makeFunc(val)
-		case reflect.Struct, reflect.Ptr:
+		case reflect.Struct, reflect.Map, reflect.Ptr:
 			data, err := encode(val)
 
 			if err != nil || data == nil {
@@ -103,42 +139,65 @@ func Expr(val interface{}) Term {
 
 			return makeArray(vals)
 		default:
+			data, err := encode(val)
+
+			if err != nil || data == nil {
+				return Term{
+					termType: p.Term_DATUM,
+					data:     nil,
+					lastErr:  err,
+				}
+			}
+
 			return Term{
 				termType: p.Term_DATUM,
-				data:     val,
+				data:     data,
 			}
 		}
 	}
 }
 
+// JSOpts contains the optional arguments for the JS term
+type JSOpts struct {
+	Timeout interface{} `rethinkdb:"timeout,omitempty"`
+}
+
+func (o JSOpts) toMap() map[string]interface{} {
+	return optArgsToMap(o)
+}
+
 // JS creates a JavaScript expression which is evaluated by the database when
 // running the query.
-func JS(jssrc interface{}) Term {
-	return constructRootTerm("Js", p.Term_JAVASCRIPT, []interface{}{jssrc}, map[string]interface{}{})
+func JS(jssrc interface{}, optArgs ...JSOpts) Term {
+	opts := map[string]interface{}{}
+	if len(optArgs) >= 1 {
+		opts = optArgs[0].toMap()
+	}
+	return constructRootTerm("Js", p.Term_JAVASCRIPT, []interface{}{jssrc}, opts)
 }
 
 // HTTPOpts contains the optional arguments for the HTTP term
 type HTTPOpts struct {
 	// General Options
-	Timeout      interface{} `gorethink:"timeout,omitempty"`
-	Reattempts   interface{} `gorethink:"reattempts,omitempty"`
-	Redirects    interface{} `gorethink:"redirect,omitempty"`
-	Verify       interface{} `gorethink:"verify,omitempty"`
-	ResultFormat interface{} `gorethink:"resul_format,omitempty"`
+	Timeout      interface{} `rethinkdb:"timeout,omitempty"`
+	Reattempts   interface{} `rethinkdb:"reattempts,omitempty"`
+	Redirects    interface{} `rethinkdb:"redirect,omitempty"`
+	Verify       interface{} `rethinkdb:"verify,omitempty"`
+	ResultFormat interface{} `rethinkdb:"result_format,omitempty"`
 
 	// Request Options
-	Method interface{} `gorethink:"method,omitempty"`
-	Auth   interface{} `gorethink:"auth,omitempty"`
-	Params interface{} `gorethink:"params,omitempty"`
-	Header interface{} `gorethink:"header,omitempty"`
-	Data   interface{} `gorethink:"data,omitempty"`
+	Method interface{} `rethinkdb:"method,omitempty"`
+	Auth   interface{} `rethinkdb:"auth,omitempty"`
+	Params interface{} `rethinkdb:"params,omitempty"`
+	Header interface{} `rethinkdb:"header,omitempty"`
+	Data   interface{} `rethinkdb:"data,omitempty"`
 
 	// Pagination
-	Page      interface{} `gorethink:"page,omitempty"`
-	PageLimit interface{} `gorethink:"page_limit,omitempty"`
+	Page      interface{} `rethinkdb:"page,omitempty"`
+	PageLimit interface{} `rethinkdb:"page_limit,omitempty"`
 }
 
-func (o *HTTPOpts) toMap() map[string]interface{} {
+func (o HTTPOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -192,9 +251,15 @@ func Binary(data interface{}) Term {
 		b = data
 	default:
 		typ := reflect.TypeOf(data)
-		if (typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array) &&
-			typ.Elem().Kind() == reflect.Uint8 {
+		if typ.Kind() == reflect.Slice && typ.Elem().Kind() == reflect.Uint8 {
 			return Binary(reflect.ValueOf(data).Bytes())
+		} else if typ.Kind() == reflect.Array && typ.Elem().Kind() == reflect.Uint8 {
+			v := reflect.ValueOf(data)
+			b = make([]byte, v.Len())
+			for i := 0; i < v.Len(); i++ {
+				b[i] = v.Index(i).Interface().(byte)
+			}
+			return Binary(b)
 		}
 		panic("Unsupported binary type")
 	}
@@ -282,6 +347,11 @@ func (t Term) CoerceTo(args ...interface{}) Term {
 }
 
 // TypeOf gets the type of a value.
+func TypeOf(args ...interface{}) Term {
+	return constructRootTerm("TypeOf", p.Term_TYPE_OF, args, map[string]interface{}{})
+}
+
+// TypeOf gets the type of a value.
 func (t Term) TypeOf(args ...interface{}) Term {
 	return constructMethodTerm(t, "TypeOf", p.Term_TYPE_OF, args, map[string]interface{}{})
 }
@@ -296,7 +366,30 @@ func (t Term) Info(args ...interface{}) Term {
 	return constructMethodTerm(t, "Info", p.Term_INFO, args, map[string]interface{}{})
 }
 
-// UUID returns a UUID (universally unique identifier), a string that can be used as a unique ID.
+// UUID returns a UUID (universally unique identifier), a string that can be used
+// as a unique ID. If a string is passed to uuid as an argument, the UUID will be
+// deterministic, derived from the string’s SHA-1 hash.
 func UUID(args ...interface{}) Term {
-	return constructRootTerm("UUID", p.Term_UUID, []interface{}{}, map[string]interface{}{})
+	return constructRootTerm("UUID", p.Term_UUID, args, map[string]interface{}{})
+}
+
+// RawQuery creates a new query from a JSON string, this bypasses any encoding
+// done by RethinkDB-go. The query should not contain the query type or any options
+// as this should be handled using the normal driver API.
+//
+// THis query will only work if this is the only term in the query.
+func RawQuery(q []byte) Term {
+	data := json.RawMessage(q)
+	return Term{
+		name:     "RawQuery",
+		rootTerm: true,
+		rawQuery: true,
+		data:     &data,
+		args: []Term{
+			Term{
+				termType: p.Term_DATUM,
+				data:     string(q),
+			},
+		},
+	}
 }

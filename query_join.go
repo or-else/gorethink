@@ -1,7 +1,7 @@
-package gorethink
+package rethinkdb
 
 import (
-	p "github.com/dancannon/gorethink/ql2"
+	p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 )
 
 // InnerJoin returns the inner product of two sequences (e.g. a table, a filter result)
@@ -21,10 +21,11 @@ func (t Term) OuterJoin(args ...interface{}) Term {
 
 // EqJoinOpts contains the optional arguments for the EqJoin term.
 type EqJoinOpts struct {
-	Index interface{} `gorethink:"index,omitempty"`
+	Index   interface{} `rethinkdb:"index,omitempty"`
+	Ordered interface{} `rethinkdb:"ordered,omitempty"`
 }
 
-func (o *EqJoinOpts) toMap() map[string]interface{} {
+func (o EqJoinOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 

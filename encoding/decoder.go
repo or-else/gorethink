@@ -9,11 +9,19 @@ import (
 
 var byteSliceType = reflect.TypeOf([]byte(nil))
 
-type decoderFunc func(dv reflect.Value, sv reflect.Value)
+type decoderFunc func(dv reflect.Value, sv reflect.Value) error
 
 // Decode decodes map[string]interface{} into a struct. The first parameter
 // must be a pointer.
 func Decode(dst interface{}, src interface{}) (err error) {
+	return decode(dst, src, true)
+}
+
+func Merge(dst interface{}, src interface{}) (err error) {
+	return decode(dst, src, false)
+}
+
+func decode(dst interface{}, src interface{}, blank bool) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if _, ok := r.(runtime.Error); ok {
@@ -46,13 +54,12 @@ func Decode(dst interface{}, src interface{}) (err error) {
 		}
 	}
 
-	decode(dv, sv)
-	return nil
+	return decodeValue(dv, sv, blank)
 }
 
-// decode decodes the source value into the destination value
-func decode(dv, sv reflect.Value) {
-	valueDecoder(dv, sv)(dv, sv)
+// decodeValue decodes the source value into the destination value
+func decodeValue(dv, sv reflect.Value, blank bool) error {
+	return valueDecoder(dv, sv, blank)(dv, sv)
 }
 
 type decoderCacheKey struct {
@@ -64,20 +71,22 @@ var decoderCache struct {
 	m map[decoderCacheKey]decoderFunc
 }
 
-func valueDecoder(dv, sv reflect.Value) decoderFunc {
+func valueDecoder(dv, sv reflect.Value, blank bool) decoderFunc {
 	if !sv.IsValid() {
 		return invalidValueDecoder
 	}
 
 	if dv.IsValid() {
 		dv = indirect(dv, false)
-		dv.Set(reflect.Zero(dv.Type()))
+		if blank {
+			dv.Set(reflect.Zero(dv.Type()))
+		}
 	}
 
-	return typeDecoder(dv.Type(), sv.Type())
+	return typeDecoder(dv.Type(), sv.Type(), blank)
 }
 
-func typeDecoder(dt, st reflect.Type) decoderFunc {
+func typeDecoder(dt, st reflect.Type, blank bool) decoderFunc {
 	decoderCache.RLock()
 	f := decoderCache.m[decoderCacheKey{dt, st}]
 	decoderCache.RUnlock()
@@ -92,15 +101,15 @@ func typeDecoder(dt, st reflect.Type) decoderFunc {
 	decoderCache.Lock()
 	var wg sync.WaitGroup
 	wg.Add(1)
-	decoderCache.m[decoderCacheKey{dt, st}] = func(dv, sv reflect.Value) {
+	decoderCache.m[decoderCacheKey{dt, st}] = func(dv, sv reflect.Value) error {
 		wg.Wait()
-		f(dv, sv)
+		return f(dv, sv)
 	}
 	decoderCache.Unlock()
 
 	// Compute fields without lock.
 	// Might duplicate effort but won't hold other computations back.
-	f = newTypeDecoder(dt, st)
+	f = newTypeDecoder(dt, st, blank)
 	wg.Done()
 	decoderCache.Lock()
 	decoderCache.m[decoderCacheKey{dt, st}] = f

@@ -1,6 +1,6 @@
-package gorethink
+package rethinkdb
 
-import p "github.com/dancannon/gorethink/ql2"
+import p "gopkg.in/rethinkdb/rethinkdb-go.v5/ql2"
 
 // Map transform each element of the sequence by applying the given mapping
 // function. It takes two arguments, a sequence and a function of type
@@ -13,10 +13,10 @@ import p "github.com/dancannon/gorethink/ql2"
 //     })
 func Map(args ...interface{}) Term {
 	if len(args) > 0 {
-		args = append(args[:len(args)-1], funcWrapArgs(args[len(args)-1:])...)
+		args = append(args[:len(args)-1], funcWrap(args[len(args)-1]))
 	}
 
-	return constructRootTerm("Map", p.Term_MAP, funcWrapArgs(args), map[string]interface{}{})
+	return constructRootTerm("Map", p.Term_MAP, args, map[string]interface{}{})
 }
 
 // Map transforms each element of the sequence by applying the given mapping
@@ -28,7 +28,11 @@ func Map(args ...interface{}) Term {
 //         return row.Mul(2)
 //     })
 func (t Term) Map(args ...interface{}) Term {
-	return constructMethodTerm(t, "Map", p.Term_MAP, funcWrapArgs(args), map[string]interface{}{})
+	if len(args) > 0 {
+		args = append(args[:len(args)-1], funcWrap(args[len(args)-1]))
+	}
+
+	return constructMethodTerm(t, "Map", p.Term_MAP, args, map[string]interface{}{})
 }
 
 // WithFields takes a sequence of objects and a list of fields. If any objects in the
@@ -49,10 +53,10 @@ func (t Term) ConcatMap(args ...interface{}) Term {
 
 // OrderByOpts contains the optional arguments for the OrderBy term
 type OrderByOpts struct {
-	Index interface{} `gorethink:"index,omitempty"`
+	Index interface{} `rethinkdb:"index,omitempty"`
 }
 
-func (o *OrderByOpts) toMap() map[string]interface{} {
+func (o OrderByOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -107,11 +111,11 @@ func (t Term) Limit(args ...interface{}) Term {
 
 // SliceOpts contains the optional arguments for the Slice term
 type SliceOpts struct {
-	LeftBound  interface{} `gorethink:"left_bound,omitempty"`
-	RightBound interface{} `gorethink:"right_bound,omitempty"`
+	LeftBound  interface{} `rethinkdb:"left_bound,omitempty"`
+	RightBound interface{} `rethinkdb:"right_bound,omitempty"`
 }
 
-func (o *SliceOpts) toMap() map[string]interface{} {
+func (o SliceOpts) toMap() map[string]interface{} {
 	return optArgsToMap(o)
 }
 
@@ -151,6 +155,15 @@ func (t Term) IsEmpty(args ...interface{}) Term {
 	return constructMethodTerm(t, "IsEmpty", p.Term_IS_EMPTY, args, map[string]interface{}{})
 }
 
+// UnionOpts contains the optional arguments for the Slice term
+type UnionOpts struct {
+	Interleave interface{} `rethinkdb:"interleave,omitempty"`
+}
+
+func (o UnionOpts) toMap() map[string]interface{} {
+	return optArgsToMap(o)
+}
+
 // Union concatenates two sequences.
 func Union(args ...interface{}) Term {
 	return constructRootTerm("Union", p.Term_UNION, args, map[string]interface{}{})
@@ -159,6 +172,18 @@ func Union(args ...interface{}) Term {
 // Union concatenates two sequences.
 func (t Term) Union(args ...interface{}) Term {
 	return constructMethodTerm(t, "Union", p.Term_UNION, args, map[string]interface{}{})
+}
+
+// UnionWithOpts like Union concatenates two sequences however allows for optional
+// arguments to be passed.
+func UnionWithOpts(optArgs UnionOpts, args ...interface{}) Term {
+	return constructRootTerm("Union", p.Term_UNION, args, optArgs.toMap())
+}
+
+// UnionWithOpts like Union concatenates two sequences however allows for optional
+// arguments to be passed.
+func (t Term) UnionWithOpts(optArgs UnionOpts, args ...interface{}) Term {
+	return constructMethodTerm(t, "Union", p.Term_UNION, args, optArgs.toMap())
 }
 
 // Sample selects a given number of elements from a sequence with uniform random
